@@ -354,7 +354,11 @@ class SwiggyClient:
         hits = [r for r in in_range if r.coupons]
         if min_pct > 0:
             hits = [r for r in hits if any(cp.kind == "percent" and (cp.percent or 0) >= min_pct for cp in r.coupons)]
-        hits.sort(key=lambda r: max((c.sort_key() for c in r.coupons), default=0), reverse=True)
+        # Fallback: if Swiggy's menu API is blocked (WAF 202), still show in-range restaurants
+        if not hits:
+            hits = sorted(in_range, key=lambda r: r.distance_km if r.distance_km is not None else 999)
+        else:
+            hits.sort(key=lambda r: max((c.sort_key() for c in r.coupons), default=0), reverse=True)
         return hits
 
     # ------------------------------------------------------------------
@@ -396,9 +400,12 @@ def fmt_restaurant(r: Restaurant, idx: int) -> str:
     lines.append(f"   ⭐ {r.rating} ({r.total_ratings})")
     if extra:
         lines.append(f"   ℹ️ {extra}")
-    lines.append("   🎟 <i>Offers:</i>")
-    for c in r.coupons:
-        lines.append(f"   → {fmt_coupon(c)}")
+    if r.coupons:
+        lines.append("   🎟 <i>Offers:</i>")
+        for c in r.coupons:
+            lines.append(f"   → {fmt_coupon(c)}")
+    else:
+        lines.append("   ⚠️ Coupon banner not available via API (open Swiggy app to see live offers)")
     if r.link:
         lines.append(f'   🔗 <a href="{html.escape(r.link, quote=True)}">Open on Swiggy</a>')
     return "\n".join(lines)
@@ -554,7 +561,6 @@ async def fetch_and_send(message: Message, bot: Bot, min_percent: Optional[int],
     wait = await message.answer("⏳ Searching Swiggy...")
     try:
         if SWIGGY_SID:
-            # Authenticated mode: enrich each in-range restaurant via its menu call
             restaurants = await CLIENT.get_offers(*loc, max_km=MAX_KM, min_pct=min_percent or 0)
         else:
             restaurants = await CLIENT.get_restaurants(*loc)
@@ -563,22 +569,26 @@ async def fetch_and_send(message: Message, bot: Bot, min_percent: Optional[int],
         await wait.edit_text(f"❌ Couldn't reach Swiggy: <code>{html.escape(str(e))[:200]}</code>", parse_mode=ParseMode.HTML)
         return
 
-    def matches(r: Restaurant) -> bool:
-        # distance filter: keep restaurants within SWIGGY_MAX_KM (default 7 km)
-        if r.distance_km is not None and r.distance_km > MAX_KM:
-            return False
+    def matches_query(r: Restaurant) -> bool:
         if query and not (
             query in r.name.lower() or any(query in c.lower() for c in r.cuisines)
         ):
             return False
-        if min_percent is not None and not any(
-            c.kind == "percent" and (c.percent or 0) >= min_percent for c in r.coupons
-        ):
-            return False
         return True
 
-    hits = [r for r in restaurants if r.coupons and matches(r)]
-    hits.sort(key=lambda r: max((c.sort_key() for c in r.coupons), default=0), reverse=True)
+    def has_min_pct(r: Restaurant) -> bool:
+        if min_percent is None:
+            return True
+        return any(c.kind == "percent" and (c.percent or 0) >= min_percent for c in r.coupons)
+
+    # Split into with-coupons vs without-coupons
+    with_coupons = [r for r in restaurants if r.coupons and has_min_pct(r) and matches_query(r)]
+    without_coupons = [r for r in restaurants if not r.coupons and matches_query(r)]
+
+    with_coupons.sort(key=lambda r: max((c.sort_key() for c in r.coupons), default=0), reverse=True)
+    without_coupons.sort(key=lambda r: r.distance_km if r.distance_km is not None else 999)
+
+    hits = with_coupons + without_coupons
     if limit:
         hits = hits[:limit]
 
@@ -592,15 +602,23 @@ async def fetch_and_send(message: Message, bot: Bot, min_percent: Optional[int],
                    'cookie ("sid") to see them — see the README.')
         wait_msg = (
             f"Found {len(restaurants)} delivery restaurants within {MAX_KM:.0f} km of your location, "
-            f"but none matched coupon offers"
+            f"but none matched"
             + (f" ≥ {min_percent}% off" if min_percent else "")
-            + (f" for “{html.escape(query)}”" if query else "") + "." + tip
+            + (f" “{html.escape(query)}”" if query else "") + "." + tip
         )
         await message.answer(wait_msg, parse_mode=ParseMode.HTML)
         return
 
     page_text = render_page(hits, 0)
-    header = f"🎟 <b>{len(hits)} restaurants with coupon offers</b>\n\n"
+    n_coupons = len(with_coupons)
+    n_total = len(hits)
+    if min_percent:
+        header = f"🎟 <b>{n_coupons} places with ≥{min_percent}% off</b>"
+    else:
+        header = f"🎟 <b>{n_coupons} with live offers</b>"
+    if n_total > n_coupons:
+        header += f" + {n_total - n_coupons} more nearby (no coupon data via API)"
+    header += f"\n\n"
     await message.answer(header + page_text, reply_markup=keyboard_for(hits, 0), parse_mode=ParseMode.HTML)
 
 
