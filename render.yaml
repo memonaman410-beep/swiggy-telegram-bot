@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: swiggy-coupons-bot
+    runtime: python
+    plan: free
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python swiggy_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SWIGGY_SID
+        sync: false
+      - key: SWIGGY_USER_ID
+        sync: false
+      - key: SWIGGY_MAX_KM
+        value: "7"
